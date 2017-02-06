@@ -225,6 +225,14 @@
 # include <iostream>
 #endif // SI_SUPPORT_IOSTREAMS
 
+#ifdef _WIN32
+#else // !_WIN32
+# include <sys/types.h>
+# include <sys/stat.h>
+# include <unistd.h>
+# include <pthread.h>
+#endif // _WIN32
+
 #ifdef _DEBUG
 # ifndef assert
 #  include <cassert>
@@ -352,6 +360,9 @@ public:
     /** map sections to key/value map */
     typedef std::map<Entry,TKeyVal,typename Entry::KeyOrder> TSection;
 
+    /** map sections to keys list */
+    typedef std::map<std::string, std::list<std::string> > TSectionParameters;
+
     /** set of dependent string pointers. Note that these pointers are
         dependent on memory owned by CSimpleIni.
     */
@@ -441,7 +452,14 @@ public:
     private:
         std::string m_scratch;
     };
-
+    
+    /** Interface definition for the Callback event
+    */
+    class CSimpleIniEvent {
+    public:
+        virtual int CSimpleIniChange( CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER> &r_CSimpleIni ) = 0;
+    };
+    
 public:
     /*-----------------------------------------------------------------------*/
 
@@ -541,6 +559,26 @@ public:
 
     /** Query the status of spaces output */
     bool UsingSpaces() const { return m_bSpaces; }
+    
+    /**
+     * Return the modification date of file
+     */
+    time_t GetFileDate(
+        );
+    
+    /**
+     * Indicate if ini file has change
+     * @return true if change
+     */
+    bool IsFileChange (
+    );
+    
+    /**
+     * Reload the ini file if modification date as change
+     * @return SI_Error
+     */
+    SI_Error ReloadFile(
+        );
     
     /*-----------------------------------------------------------------------*/
     /** @}
@@ -769,6 +807,31 @@ public:
     void GetAllSections(
         TNamesDepend & a_names
         ) const;
+
+    /**
+     * Return all Sections/Keys changed since reloading file
+     * @return List of Sections/Keys changes
+     */
+    const TSectionParameters &GetSectionsChange(
+        ) const;
+    
+    /**
+     * Set Callback for Events
+     * @param callback handler
+     */
+    void SetCallbackEvent ( CSimpleIniEvent *callback ) {
+        this->m_pCallbackEvent = callback;
+    }
+    
+    /**
+     * Starts the checking of the ini file
+     */
+    void StartCheckFile ( void );
+    
+    /**
+     * Stop the checking of the ini file
+     */
+    void StopCheckFile ( void );
 
     /** Retrieve all unique key names in a section. The sort order of the
         returned strings is NOT DEFINED. You can sort the names into the load 
@@ -1228,6 +1291,8 @@ private:
         const SI_CHAR * a_pText
         ) const;
 
+    static void *ThreadCheckFile(void *parameters);
+    
 private:
     /** Copy of the INI file data in our character format. This will be
         modified when parsed to have NULL characters added after all
@@ -1244,6 +1309,21 @@ private:
 
     /** File comment for this data, if one exists. */
     const SI_CHAR * m_pFileComment;
+    
+    /** File path */
+    std::string m_sFile;
+    
+    /** Modification date of file  */
+    time_t m_lFileDate;
+    
+    /** Sections/Keys Added,Changed or removed after reloading */
+    TSectionParameters m_changed;
+    
+    /** Callback call after reloading file */
+    CSimpleIniEvent *m_pCallbackEvent;
+    
+    /** Thread id from ThreadCheckFile */
+    pthread_t m_threadId;
 
     /** Parsed INI data. Section -> (Key -> Value). */
     TSection m_data;
@@ -1285,6 +1365,9 @@ CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::CSimpleIniTempl(
   : m_pData(0)
   , m_uDataLen(0)
   , m_pFileComment(NULL)
+  , m_lFileDate(0)
+  , m_pCallbackEvent(NULL)
+  , m_threadId(0)
   , m_bStoreIsUtf8(a_bIsUtf8)
   , m_bAllowMultiKey(a_bAllowMultiKey)
   , m_bAllowMultiLine(a_bAllowMultiLine)
@@ -1296,6 +1379,7 @@ template<class SI_CHAR, class SI_STRLESS, class SI_CONVERTER>
 CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::~CSimpleIniTempl()
 {
     Reset();
+    this->StopCheckFile();
 }
 
 template<class SI_CHAR, class SI_STRLESS, class SI_CONVERTER>
@@ -1323,11 +1407,177 @@ CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::Reset()
 
 template<class SI_CHAR, class SI_STRLESS, class SI_CONVERTER>
 SI_Error
+CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::ReloadFile(
+    )
+{
+    FILE * fp = NULL;
+    
+    if ( m_sFile.empty() ) {
+        return SI_FAIL;
+    }
+    
+    if ( !IsFileChange() ) {
+        return SI_FAIL;
+    }
+    
+#if __STDC_WANT_SECURE_LIB__ && !_WIN32_WCE
+    fopen_s(&fp, m_sFile.c_str(), "rb");
+#else // !__STDC_WANT_SECURE_LIB__
+    fp = fopen(m_sFile.c_str(), "rb");
+#endif // __STDC_WANT_SECURE_LIB__
+    if (!fp) {
+        return SI_FILE;
+    }
+    
+    // Save old sections keys/values
+    std::map<std::string, std::map<std::string, std::string> > _prevSectionsKeysValues;
+    
+    for ( typename TSection::iterator it = this->m_data.begin();
+            it != this->m_data.end();
+            it++ ) {
+        std::map<std::string, std::string> _keysvalues;
+        
+        for ( typename TKeyVal::iterator it2 = (*it).second.begin();
+                it2 != (*it).second.end();
+                it2++ ) {
+
+            _keysvalues.insert( std::pair<std::string,std::string>(
+                (*it2).first.pItem,
+                (*it2).second
+            ) );
+        }
+        
+        _prevSectionsKeysValues[(*it).first.pItem] = _keysvalues;
+    }
+    this->Reset();
+    
+    SI_Error rc = LoadFile(fp);
+    fclose(fp);
+    
+    //
+    this->m_changed.clear();
+    
+    if ( rc == SI_OK ) {
+        m_lFileDate = GetFileDate();
+        
+        // Add Sections/Keys
+        for ( typename TSection::iterator it = this->m_data.begin();
+                it != this->m_data.end();
+                it++ ) {
+            const SI_CHAR *_section_n = (*it).first.pItem;
+            
+            // New section
+            std::map<std::string, std::map<std::string, std::string> >::iterator itPrevSectionsKeysValues;
+            std::map<std::string, std::string>::iterator itPrevKeysValues;
+            std::list<std::string> _keys_changed;
+            
+            itPrevSectionsKeysValues = _prevSectionsKeysValues.find(_section_n);
+            
+            // New Sections
+            if ( itPrevSectionsKeysValues == _prevSectionsKeysValues.end() ) {
+
+                // Insert all keys
+                for ( typename TKeyVal::iterator it2 = (*it).second.begin(); 
+                        it2 != (*it).second.end();
+                        it2++ ) {
+                    _keys_changed.push_front( (*it2).first.pItem );
+                    printf("Changed Add:[%s]%s\n", (char*)_section_n, (char*)(*it2).first.pItem );
+                }
+            }
+            else {
+                
+                // Check keys/value
+                for ( typename TKeyVal::iterator it2 = (*it).second.begin(); 
+                        it2 != (*it).second.end();
+                        it2++ ) {
+                    
+                    const SI_CHAR *_key_n = (*it2).first.pItem;
+                    const SI_CHAR *_value_n = (*it2).second;
+                    
+                    itPrevKeysValues = (*itPrevSectionsKeysValues).second.find( _key_n );
+                    
+                    // New key
+                    if ( itPrevKeysValues == (*itPrevSectionsKeysValues).second.end() ) {
+                        _keys_changed.push_front( _key_n );
+                    }
+                    else {
+                        // Value change
+                        if ( (*itPrevKeysValues).second.compare(_value_n) != 0 ) {
+                            _keys_changed.push_front( _key_n );
+                        }
+                    }
+                }
+            }
+            
+            if ( !_keys_changed.empty() ) {
+
+                this->m_changed.insert( std::pair<std::string, std::list<std::string> >(
+                        _section_n,
+                        _keys_changed
+                        ));
+            }
+        }
+        
+        // Removed Sections/Keys
+        for ( std::map<std::string, std::map<std::string, std::string> >::iterator it = _prevSectionsKeysValues.begin();
+                it != _prevSectionsKeysValues.end();
+                it++ ) {
+            
+            const std::string _section_o = (*it).first;
+            
+            std::list<std::string> _keys_changed;
+            typename TSection::iterator itCurrSectionsKeysValue = this->m_data.find( (SI_CHAR*) _section_o.c_str());
+            
+            // Removed Section
+            if ( itCurrSectionsKeysValue == this->m_data.end() ) {
+                
+                // Insert all keys
+                for ( std::map<std::string, std::string>::iterator it2 = (*it).second.begin(); 
+                        it2 != (*it).second.end();
+                        it2++ ) {
+                    _keys_changed.push_front( (*it2).first );
+                }
+            }
+            else {
+                
+                for ( std::map<std::string, std::string>::iterator it2 = (*it).second.begin();
+                        it2 != (*it).second.end();
+                        it2++ ) {
+                    
+                    if ( (*itCurrSectionsKeysValue).second.find( (SI_CHAR*) (*it2).first.c_str() ) == (*itCurrSectionsKeysValue).second.end() ) {
+                        _keys_changed.push_front( (*it2).first );
+                    }
+                }
+            }
+            
+            if ( !_keys_changed.empty() ) {
+
+                this->m_changed.insert( std::pair<std::string, std::list<std::string> >(
+                        _section_o,
+                        _keys_changed
+                        ));
+            }
+        }
+
+        if ( !this->m_changed.empty() && m_pCallbackEvent != NULL ) {
+            m_pCallbackEvent->CSimpleIniChange( (*this) );
+        }
+    }
+        
+    return rc;
+}
+    
+
+template<class SI_CHAR, class SI_STRLESS, class SI_CONVERTER>
+SI_Error
 CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::LoadFile(
     const char * a_pszFile
     )
 {
     FILE * fp = NULL;
+    m_sFile.clear();
+    m_lFileDate = 0;
+    
 #if __STDC_WANT_SECURE_LIB__ && !_WIN32_WCE
     fopen_s(&fp, a_pszFile, "rb");
 #else // !__STDC_WANT_SECURE_LIB__
@@ -1338,7 +1588,51 @@ CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::LoadFile(
     }
     SI_Error rc = LoadFile(fp);
     fclose(fp);
+    
+    if ( rc == SI_OK ) {
+        m_sFile.assign(a_pszFile);
+        m_lFileDate = GetFileDate();
+    }
+    
     return rc;
+}
+
+template<class SI_CHAR, class SI_STRLESS, class SI_CONVERTER>
+time_t
+CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::GetFileDate(
+    )
+{
+#ifdef _WIN32
+#else
+    struct stat s_stat;
+    if ( m_sFile.empty() ) {
+        return 0;
+    }
+    
+    if ( stat(m_sFile.c_str(), &s_stat) == 0 ) {
+        return s_stat.st_mtim.tv_sec;
+    }
+#endif
+    return 0;
+}
+
+template<class SI_CHAR, class SI_STRLESS, class SI_CONVERTER>
+bool
+CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::IsFileChange(
+    )
+{
+    bool change = false;
+    
+#ifdef _WIN32
+#else
+    time_t u_fileDate = GetFileDate();
+    
+    if ( u_fileDate ) {
+        return u_fileDate != m_lFileDate;
+    }
+#endif
+    
+    return change;
 }
 
 #ifdef SI_HAS_WIDE_FILE
@@ -2071,7 +2365,7 @@ CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::SetLongValue(
 #if __STDC_WANT_SECURE_LIB__ && !_WIN32_WCE
     sprintf_s(szInput, a_bUseHex ? "0x%lx" : "%ld", a_nValue);
 #else // !__STDC_WANT_SECURE_LIB__
-    sprintf(szInput, a_bUseHex ? "0x%lx" : "%ld", a_nValue);
+    snprintf(szInput, 64, a_bUseHex ? "0x%lx" : "%ld", a_nValue);
 #endif // __STDC_WANT_SECURE_LIB__
 
     // convert to output text
@@ -2133,7 +2427,7 @@ CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::SetDoubleValue(
 #if __STDC_WANT_SECURE_LIB__ && !_WIN32_WCE
 	sprintf_s(szInput, "%f", a_nValue);
 #else // !__STDC_WANT_SECURE_LIB__
-	sprintf(szInput, "%f", a_nValue);
+	snprintf(szInput, 64, "%f", a_nValue);
 #endif // __STDC_WANT_SECURE_LIB__
 
 	// convert to output text
@@ -2303,6 +2597,55 @@ CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::GetAllSections(
     for (int n = 0; i != m_data.end(); ++i, ++n ) {
         a_names.push_back(i->first);
     }
+}
+
+template<class SI_CHAR, class SI_STRLESS, class SI_CONVERTER>
+const typename CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::TSectionParameters &
+CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::GetSectionsChange(
+    ) const
+{
+    return this->m_changed;
+}
+
+template<class SI_CHAR, class SI_STRLESS, class SI_CONVERTER>
+void
+CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::StartCheckFile()
+{
+    if ( this->m_threadId != 0 )
+        return;
+    
+    pthread_attr_t  thread_attr;
+    int		rc;
+    size_t      stackSize = 1024*16;
+
+    rc = pthread_attr_init(&thread_attr);
+    if (rc != 0)
+        return;
+
+    rc = pthread_attr_setstacksize (&thread_attr, stackSize); 
+    if (rc != 0)
+        return;
+
+    rc = pthread_create(&this->m_threadId, &thread_attr, CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::ThreadCheckFile, this);
+    if (rc != 0)
+        return;
+
+    rc = pthread_attr_destroy(&thread_attr);
+    if (rc != 0)
+        return;;
+}
+
+template<class SI_CHAR, class SI_STRLESS, class SI_CONVERTER>
+void
+CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::StopCheckFile()
+{
+    if ( this->m_threadId == 0 )
+        return;
+    
+    pthread_cancel(this->m_threadId);
+    pthread_join(this->m_threadId, NULL);
+    
+    this->m_threadId = 0;
 }
 
 template<class SI_CHAR, class SI_STRLESS, class SI_CONVERTER>
@@ -2547,6 +2890,28 @@ CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::OutputMultiLineText(
         a_oOutput.Write(SI_NEWLINE_A);
     }
     return true;
+}
+
+template<class SI_CHAR, class SI_STRLESS, class SI_CONVERTER>
+void *
+CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::ThreadCheckFile(
+    void *handler
+    )
+{
+    CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER> *_si = 
+            static_cast < CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER> *> 
+            (handler);
+    
+    while (1) {
+        
+        if ( _si->IsFileChange() ) {
+            _si->ReloadFile();
+        }
+        sleep (1);
+    }
+    
+    pthread_exit(0);
+    return NULL;
 }
 
 template<class SI_CHAR, class SI_STRLESS, class SI_CONVERTER>
