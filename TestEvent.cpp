@@ -12,6 +12,10 @@
 
 TestEvent::TestEvent() {
     
+    m_configuration = new ConfigurationImpl("test.ini");
+    
+    m_configuration->addListener ( "section", this );
+    
     simpleIni.Reset();
     simpleIni.LoadFile( "test.ini" );
     
@@ -23,6 +27,14 @@ TestEvent::TestEvent() {
 }
 
 TestEvent::~TestEvent() {
+    
+    if ( m_configuration != NULL ) {
+        delete m_configuration;
+    }
+}
+
+void TestEvent::CfgChange ( string module, Configuration &cfg ) {
+    
 }
 
 int TestEvent::CSimpleIniChange(CSimpleIni& r_CSimpleIni) {

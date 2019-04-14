@@ -8,18 +8,21 @@
 #ifndef TESTEVENT_H
 #define	TESTEVENT_H
 
-#include "SimpleIni.h"
+#include "ConfigurationImpl.h"
 
-class TestEvent: public CSimpleIni::CSimpleIniEvent {
+class TestEvent: public CSimpleIni::CSimpleIniEvent, public ConfigurationListener {
 public:
     TestEvent();
     virtual ~TestEvent();
     
 
     virtual int CSimpleIniChange(CSimpleIni& r_CSimpleIni);
+    virtual void CfgChange ( string module, Configuration &cfg );
     
 private:
     CSimpleIni simpleIni;
+    
+    ConfigurationImpl *m_configuration;
 
 };
 

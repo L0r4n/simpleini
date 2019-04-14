@@ -23,7 +23,7 @@ test: testsi
 	diff test1-output.ini test1-expected.ini
 
 testevent: test-ini.c TestEvent.cpp TestEvent.h
-	$(CC) test-ini.c TestEvent.cpp -lpthread -o testevent
+	$(CC) test-ini.c TestEvent.cpp Configuration.cpp -lpthread -o testevent
 	
 install:
 	@echo No install required. Just include the SimpleIni.h header file to use it.
